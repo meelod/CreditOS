@@ -2,20 +2,7 @@
 
 A prototype underwriting workspace for a direct-lending team — pipeline tracking, deal detail with capital structure, due diligence management, and IC memo generation.
 
-## Brief
-
-- Built in a handful of hours.
-- No access to client systems — all data is hand-built mocks.
-- Optimized to impress both a technical audience (architecture, data model, separation of concerns) and a non-technical investment team (Excel-native UX: AG Grid everywhere, Ant Design primitives, dense tabular data, no flashy elements).
-
-## Run it
-
-```bash
-pnpm install
-pnpm dev
-```
-
-Open [http://localhost:3000](http://localhost:3000). Requires Node 20+. No external services.
+Run with `pnpm install && pnpm dev` (Node 20+). No external services required.
 
 ---
 
@@ -74,47 +61,14 @@ Data layer (no backend yet):
                     returns formatted plain text)
   lib/utils.ts   → formatCurrency / formatMultiple / formatPercent /
                     formatDate
+
+Rendering: most deal pages are client components (AG Grid + interactive
+filters/tabs/drawer). The deal route itself is a server component that
+loads from the static deal store and passes a serializable Deal down.
+generateStaticParams pre-renders every deal page at build.
 ```
 
-Rendering: most deal pages are client components (AG Grid + interactive filters/tabs/drawer). The deal route itself is a server component that loads from the static deal store and passes a serializable `Deal` down. `generateStaticParams` pre-renders every deal page at build.
-
 The "everything is one grid wrapper" decision was deliberate. Once `DataGrid.tsx` exists, every dataset on the deal page (financials, risks, tranches, diligence) gets the same theme, the same sort/filter/resize behaviour, and the same tabular numerals — no surprises for an Excel-native user.
-
----
-
-## Design choices (and why)
-
-These are the decisions made during the build, in roughly the order they came up. Several were course-corrected based on direct feedback from the investment audience.
-
-**Audience-first UX over visual polish.** The user is an Excel-native deal team. Early drafts had hero KPI cards, a kanban pipeline, gradient accents, and animated transitions — all torn out. Replaced with dense AG Grid tables, neutral colors, no animations beyond essential feedback. Excel is the mental model.
-
-**AG Grid for every tabular dataset, not just the pipeline.** Initially used a custom HTML table for the pipeline, then antd `Table` for everything inside the deal page. Both got replaced with AG Grid via a single shared wrapper (`components/DataGrid.tsx`). One sort/filter/resize behaviour, one theme, tabular numerals everywhere. An Excel user lands and immediately knows how to interact with every grid on the page.
-
-**Ant Design for primitives, not a custom design system.** Buttons, Cards, Tabs, Drawer, Descriptions, Tag, Statistic, Form, Segmented — all antd. The look is "enterprise data tool," which is exactly what credit underwriting software looks like (DealCloud, Pitchbook, Backstop). Building bespoke components would burn time without gaining anything the audience values.
-
-**No KPI hero cards or kanban on the pipeline.** The first version had four big metric cards and a kanban view above the grid. The investment team explicitly didn't want them — they want data, sortable. Stage filtering is a chip row above the grid, not a board.
-
-**3-item sidebar (Pipeline / Portfolio / Markets), not 4.** "IC Memos" was originally a top-level page; it was redundant because every deal already has an IC Memo tab. Fewer top-level destinations = lower learning curve. Each remaining section serves a distinct workflow (origination · monitoring · pricing intelligence).
-
-**Tabs on the deal page, not nested routes.** Overview / Capital Structure / Due Diligence / IC Memo all live under one route (`/deals/[id]`) with antd `Tabs`. The deal context (header strip, breadcrumb) stays sticky; flipping between tabs feels like flipping between sections of the same memo, not navigating between pages.
-
-**Calendar view in Due Diligence (toggled, not always on).** Diligence has both a Grid view (workstream-grouped tables) and a Calendar view (5-week month grid, color-coded by workstream, completed items struck through, flagged items badged). The grid is the default because it's what the team uses today; the calendar is a one-click upgrade for IC-prep weeks where what matters is "what's due before Friday." A `Segmented` control switches them.
-
-**Add-Note is a Drawer, not a modal or a separate page.** A modal blocks the deal context; a separate page costs a navigation. A right-side drawer keeps the deal visible behind it, supports scroll-through note history, and is the standard antd pattern for contextual side-panels.
-
-**Edit buttons everywhere, but mocked.** Every section header has an `Edit` affordance that fires a toast in this prototype. They're there to make clear that field-level inline editing is the production model — not modal forms, not a separate "edit mode" toggle. In production each `Edit` opens an inline editor scoped to that section.
-
-**IC Memo is a deterministic typed function, not an LLM call.** `lib/memo.ts` exports `buildMemo(deal: Deal): string`. It interpolates typed fields into template literals — no regex, no parsing, no LLM. Rationale: deterministic output, fully reviewable, no failure modes, no API key. The template is what production-grade tools generate today; an LLM rewrite is a Day-2 enhancement, not the demo's value prop. (Earlier versions streamed character-by-character to feel "AI-like" — pulled out per feedback that nothing should feel LLM-flavored.)
-
-**One `Deal` aggregate type, not normalized tables.** The data model collapses what would be 6+ tables in a real backend (deals, tranches, diligence items, risks, covenants, financials, terms) into a single `Deal` shape. This makes the memo template, the deal page, and the pipeline grid all one-line renderers over a typed object. In production each array becomes its own table joined to deals; the prototype skips the join.
-
-**Static `lib/data.ts` instead of a backend.** Every page reads the same in-memory deals array. `generateStaticParams` pre-renders every deal page at build. Swapping in a real DB (Postgres + Drizzle, schema mirrors `lib/types.ts`) is a one-file change. Building a backend now would be the slowest path to "this looks credible to a deal team."
-
-**Server components for routes, client components for grids.** The deal route (`app/deals/[id]/page.tsx`) is a server component — it loads from the static deal store and passes a serializable `Deal` down. The interactive children (AG Grid, antd Tabs, the drawer) are client components. This split keeps the initial HTML lightweight and avoids passing render functions across the server/client boundary (a real bug we hit and fixed mid-build).
-
-**Tailwind v4 alongside Ant Design, not instead of.** Tailwind handles layout/spacing/typography utilities at the page and section level. Antd handles the primitives. They coexist cleanly because antd v6 uses CSS-in-JS (no global stylesheet conflicts).
-
-**Realistic mock data, not Lorem Ipsum.** The 8 deals in `lib/data.ts` use plausible direct-lending economics: 4–6x leverage, S+550 to S+700 spreads, mid-market EBITDA scale, real sponsor archetypes (LBO / refi / acq financing / divrecap / growth), real workstream owners (KPMG, Latham, L.E.K., Bain, Marsh, PwC). When a credit professional looks at the deal page, the numbers should pass a sniff test in 3 seconds.
 
 ---
 
@@ -148,8 +102,6 @@ Deal {
 ```
 
 This shape was picked to make the IC memo template (`lib/memo.ts`) trivial to render — every section the memo needs already lives on the `Deal`. In a real backend, each of these arrays becomes its own table joined to a deals table; the prototype keeps the join collapsed for speed.
-
-The **IC memo** itself is generated by a typed TypeScript function — not regex, not an LLM. `buildMemo(deal: Deal): string` interpolates fields into template-literal blocks for each section and joins repeating items (tranches, risks, diligence) with `Array.map().join("\n")`. Deterministic — same `Deal` always produces the same memo.
 
 ---
 
