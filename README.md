@@ -120,36 +120,201 @@ These are the decisions made during the build, in roughly the order they came up
 
 ## 3. Data model
 
-A single `Deal` aggregate holds everything the UI needs:
+### Why one `Deal` aggregate
+
+I model the workspace around a single `Deal` aggregate that owns everything the UI ever needs to render about that deal — financials, capital structure, diligence, risks, terms, covenants, sponsor, thesis. There is no separate "deal header" object, "deal financials" object, etc.
+
+This shape was picked for three reasons:
+
+1. **The IC memo template stays trivial.** `buildMemo(deal: Deal): string` reads every section it needs off one object and writes it out. If financials lived in their own service, the memo generator would need joins, fetches, and null-handling. Here it's `deal.financials.map(...)`.
+2. **Pages and grids become dumb renderers.** `app/page.tsx` is `<PipelineGrid>`. The grid renders `deals: Deal[]`. The deal page renders `deal: Deal`. There's no client-side merging of related entities.
+3. **It models how a deal team thinks.** When an analyst says "the Atlas deal," they mean every fact about Atlas — not "the deal record joined to the diligence schedule joined to the cap stack." Storage shape ≠ domain shape.
+
+In a real backend each of these nested arrays becomes its own table (`tranches`, `dd_items`, `risks`, `covenants`, `financial_periods`) joined to a `deals` table — but the API layer should still hydrate one `Deal` aggregate per request to keep the front-end simple.
+
+### Top-level `Deal` fields
 
 ```ts
-Deal {
-  id, code, borrowerName, description
-  sector, geography, stage          // Sourcing | Screening | IOI |
-                                    // Diligence | IC Review | Closed | Passed
-  sponsor: { name, type, fundSize }
-  useOfProceeds                     // LBO | Refi | Acquisition | Recap | Growth
-  totalDealSizeMM, ourCommitmentMM
-  financials: FinancialPeriod[]     // FY22 / FY23 / LTM / FY24E
-  ltmRevenue, ltmEbitda
-  totalLeverage, seniorLeverage, ltv, fixedChargeCoverage
-  blendedYield, blendedSpread       // %, bps
-  capitalStructure: Tranche[]       // Revolver, TLB, Unitranche, 2L,
-                                    //   Mezz, PIK, Equity (with rate,
-                                    //   floor, OID, call schedule, hold)
-  diligence: DDItem[]               // workstream, task, owner, status,
-                                    //   dueDate, notes
-  risks: Risk[]                     // category, severity, description,
-                                    //   mitigant
-  keyTerms: { label, value }[]
-  covenants: { name, threshold, cushion }[]
-  expectedClose, leadAnalyst, thesis
+interface Deal {
+  id: string;                       // route param: /deals/:id
+  code: string;                     // human-friendly: "PROJ-MERIDIAN"
+  borrowerName: string;
+  description: string;              // 1-2 sentences for the deal page header
+  sector: Sector;                   // Healthcare | Software | Industrials |
+                                    //   Consumer | Business Services |
+                                    //   Financial Services
+  geography: string;                // free text — "United States (Southeast)"
+  stage: DealStage;                 // Sourcing | Screening | IOI |
+                                    //   Diligence | IC Review | Closed | Passed
+  sponsor: Sponsor;                 // see below
+  useOfProceeds: UseOfProceeds;     // LBO | Refinancing |
+                                    //   Acquisition Financing |
+                                    //   Dividend Recap | Growth Capital
+
+  // headline economics — pre-computed for grid/header speed
+  totalDealSizeMM: number;          // total transaction size, $MM
+  ourCommitmentMM: number;          // our hold across all tranches, $MM
+  ltmRevenue: number;               // duplicated from financials for grid speed
+  ltmEbitda: number;
+  totalLeverage: number;            // total debt / LTM EBITDA
+  seniorLeverage: number;           // senior debt / LTM EBITDA
+  ltv: number;                      // loan-to-value, %
+  fixedChargeCoverage: number;      // EBITDA - capex / fixed charges
+  blendedYield: number;             // weighted avg yield across our hold, %
+  blendedSpread: number;            // weighted avg spread, bps
+
+  // related collections
+  financials: FinancialPeriod[];
+  capitalStructure: Tranche[];
+  diligence: DDItem[];
+  risks: Risk[];
+  keyTerms: { label: string; value: string }[];
+  covenants: { name: string; threshold: string; cushion?: string }[];
+
+  // workflow metadata
+  expectedClose: string;            // ISO date
+  leadAnalyst: string;
+  thesis: string;                   // paragraph for the Overview tab
 }
 ```
 
-This shape was picked to make the IC memo template (`lib/memo.ts`) trivial to render — every section the memo needs already lives on the `Deal`. In a real backend, each of these arrays becomes its own table joined to a deals table; the prototype keeps the join collapsed for speed.
+A note on the duplication: `ltmRevenue`, `ltmEbitda`, `totalLeverage`, etc. are also derivable from `financials` and `capitalStructure`. They're stored on the top level deliberately — the pipeline grid renders 30+ rows × 6+ headline metrics; computing those from nested arrays per row would be wasted work. In production this is what materialized columns or a denormalized summary table give you.
 
-The **IC memo** itself is generated by a typed TypeScript function — not regex, not an LLM. `buildMemo(deal: Deal): string` interpolates fields into template-literal blocks for each section and joins repeating items (tranches, risks, diligence) with `Array.map().join("\n")`. Deterministic — same `Deal` always produces the same memo.
+### `Sponsor`
+
+```ts
+interface Sponsor {
+  name: string;                     // "Westview Capital Partners IV"
+  type: "Sponsor-backed" | "Founder-led" | "Public";
+  fundSize?: number;                // $MM, only for Sponsor-backed
+}
+```
+
+Just enough for the deal header and the IC memo's exec summary. The `type` discriminator drives a few UI decisions (e.g., founder-led deals don't show a fund size). A real model would carry track record, prior LP relationships, sector focus, and recent dry-powder estimates — all skipped here.
+
+### `FinancialPeriod` — the financials array
+
+```ts
+interface FinancialPeriod {
+  label: string;                    // "FY22" | "FY23" | "LTM" | "FY24E"
+  revenue: number;                  // $MM
+  ebitda: number;                   // $MM
+  ebitdaMargin: number;             // %
+}
+```
+
+A flat row per period. Why an array of typed labels instead of `{ fy22: …, fy23: …, ltm: … }`?
+
+- **Period sets vary by deal.** Some deals only have LTM + management projections; some have 3 years of audited history. An array handles both cleanly.
+- **Renders directly into a grid.** The Overview tab's "Historical & Projected Financials" table is one line: `<DataGrid rowData={deal.financials} />`.
+- **The memo iterates with `.map()`.** No hard-coded period names in the template.
+
+What's intentionally missing: working capital, capex, free cash flow, debt schedule, projected covenants. A real underwriting model carries 30+ line items per period and 3+ scenarios (base / upside / downside). This carries 3 — that's enough to demo the section but not enough to underwrite.
+
+### `Tranche` — the capital structure array
+
+```ts
+interface Tranche {
+  id: string;
+  name: string;                     // "Senior Secured Unitranche"
+  type:
+    | "Revolver"
+    | "Term Loan A" | "Term Loan B"
+    | "Unitranche"
+    | "Second Lien" | "Mezzanine" | "PIK Note"
+    | "Equity";
+  amountMM: number;                 // tranche size
+  rate: string;                     // "S+625" or "12.0% Cash + 3.0% PIK"
+  floor?: string;                   // SOFR floor, e.g. "1.00%"
+  oid?: string;                     // original issue discount, e.g. "2.00%"
+  maturityYears: number;
+  seniority: number;                // 1 = most senior; equity = 99
+  ourHoldMM?: number;               // amount we are committing in this tranche
+  call?: string;                    // call schedule, e.g. "NC1, 102, 101"
+}
+```
+
+This was the most considered subtype. Private credit deal teams think in tranches — a deal is a stack of tranches with different priorities, pricing, and protections. Decisions made here:
+
+- **Equity is a tranche.** It has no rate or call, but treating equity as `Tranche` with `type: "Equity"` means the capital-stack visualization, the Sources of Capital grid, and the % of total cap calculations all iterate over a single array. No special-casing.
+- **`rate` is a string, not a number.** Real pricing isn't a single number — it's "S+625, 1% floor, 2% OID" or "12% cash + 3% PIK." Stringly-typed. We store the components separately (`floor`, `oid`) for cases where we need them, but the headline display is `rate`.
+- **`seniority: number` instead of an enum.** Lets us sort the cap stack with `[...].sort((a,b) => a.seniority - b.seniority)` and use `99` as a sentinel for equity. An enum would force lookups every time we want to sort.
+- **`ourHoldMM` is per-tranche.** Big deals span multiple tranches and we may hold different amounts in each. Aggregating to `Deal.ourCommitmentMM` happens at the Deal level (and is also stored top-level for grid speed, per the duplication note above).
+- **Cumulative leverage is computed, not stored.** The Securities tab shows "cumul. lev." per tranche — that's `cumulativeDebt / ltmEbitda` summed top-down. Storing it would make every tranche edit a multi-row update.
+
+Skipped: amortization schedule, MFN baskets, ECF sweep mechanics, prepayment economics. All would matter in production; none matter for the demo.
+
+### `DDItem` — the diligence array
+
+```ts
+type DDStatus = "Not Started" | "In Progress" | "Complete" | "Flagged";
+
+interface DDItem {
+  id: string;
+  workstream:
+    | "Financial" | "Legal" | "Commercial"
+    | "Operational" | "ESG" | "Tax" | "Insurance";
+  task: string;                     // "QofE review (Alvarez & Marsal)"
+  owner: string;                    // "S. Park" or "Latham"
+  status: DDStatus;
+  dueDate: string;                  // ISO date
+  notes?: string;                   // surfaced in IC memo for "Flagged" items
+}
+```
+
+A flat list. The Diligence tab groups by `workstream` for the per-section grids and bins by `dueDate` for the calendar view. Both are derived at render time:
+
+```ts
+const byWorkstream = items.filter((d) => d.workstream === "Financial");
+const itemsByDay   = items.reduce((m, i) => /* bin by date */ m, new Map());
+```
+
+`workstream` is a closed enum because the seven categories are industry-standard for credit underwriting — a Tax workstream and an ESG workstream are real things on the deal calendar, and the team would push back if we let people invent new categories. `status: "Flagged"` is treated specially: the IC memo template scans for flagged items and lists them in the diligence section so they don't get buried.
+
+Skipped: file attachments per task, comment threads, dependency edges between tasks, owner email lookups. The notes drawer is the closest stand-in for a comment thread.
+
+### `Risk` — the risks array
+
+```ts
+interface Risk {
+  category: "Credit" | "Market" | "Operational" | "ESG" | "Legal";
+  severity: "Low" | "Medium" | "High";
+  description: string;
+  mitigant?: string;
+}
+```
+
+Risks are paired with mitigants because that's how credit memos read — never raise a risk without addressing it. The IC memo template enforces the pairing in its rendering loop. `severity` drives the colored badge in the risks grid (green/gold/red Tag) and could drive sorting; `category` is closed because IC's risk taxonomy is fixed.
+
+### `keyTerms` and `covenants` — the open-shape stragglers
+
+```ts
+keyTerms: { label: string; value: string }[];
+covenants: { name: string; threshold: string; cushion?: string }[];
+```
+
+These are deliberately the loosest types. Term sheets vary so much across deals (an LBO has different headline terms than a divrecap) that any closed schema would fight reality. `keyTerms` is just a labelled list — analyst writes the label, analyst writes the value, the Overview tab renders it as a `<Descriptions>`. `covenants` is slightly more structured because the cushion-vs-base-case framing is universal.
+
+If a future iteration wanted automated covenant compliance tracking against quarterly reporting, `threshold` would need to become structured (`{ metric: string, op: "≤"|"≥", value: number }`). Today it's free text — fine for display, useless for computation.
+
+### What lives only on the deal page (not the type)
+
+- **Notes** — the Add-Note drawer keeps notes in component state. They'd belong on the `Deal` (or a related `notes: Note[]`) in production but they're ephemeral demo state today.
+- **Stage transitions / audit log** — when "Submit to IC" succeeds in the demo it just flips a local boolean. In production this writes a row to a `deal_events` table and changes `Deal.stage`.
+- **Sensitivity** — the −20% EBITDA stress on the Capital Structure tab is computed inline, not stored. A real model would persist named scenarios.
+
+### Where this breaks down
+
+The single-aggregate model breaks if:
+- You need cross-deal queries that don't fit a SQL `where` (e.g., "show me every diligence item across the portfolio that's flagged"). You'd want a `dd_items` table indexed by status, not a `deals.dd_items[]` array.
+- Multiple users edit different sections of the same deal concurrently. Section-level optimistic concurrency is awkward when the whole deal is the unit.
+- Diligence items get heavy enough (file attachments, comment threads) that loading them eagerly with the deal becomes wasteful.
+
+For an underwriting workspace at the size a private credit fund actually runs (dozens of deals in flight, not thousands), the aggregate works.
+
+### How the IC memo consumes the model
+
+`lib/memo.ts` exports `buildMemo(deal: Deal): string`. It interpolates typed fields into template-literal blocks for each section and joins repeating items (tranches, risks, diligence) with `Array.map().join("\n")`. Deterministic — same `Deal` always produces the same memo. No regex, no parsing, no LLM. In production the entry point stays the same; the body becomes a structured-output LLM call that takes the same `Deal` and returns a richer narrative with citations.
 
 ---
 
